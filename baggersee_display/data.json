@@ -1,0 +1,35 @@
+{
+  "wasser_temp": "19.3",
+  "luft_temp": "20",
+  "slideshow_interval": 1,
+  "show_temp_interval": 1,
+  "slides": [
+    {
+      "filename": "PXL_20260612_100854210.jpg",
+      "caption": "",
+      "type": "image"
+    },
+    {
+      "filename": "PXL_20260612_100810403.jpg",
+      "caption": "",
+      "type": "image"
+    }
+  ],
+  "last_updated": "2026-06-16T16:24:06.785070",
+  "monitor_count": 2,
+  "show_weather": true,
+  "luft_source": "csv",
+  "usb_port": "COM1",
+  "usb_baud": 9600,
+  "orientation": "landscape",
+  "csv_path": "",
+  "email_enabled": false,
+  "email_server": "imap.gmail.com",
+  "email_port": 993,
+  "email_user": "",
+  "email_password": "",
+  "email_folder": "INBOX",
+  "email_check_interval": 5,
+  "update_url": "",
+  "weather_interval": 20
+}
