@@ -22,7 +22,7 @@ _BASE = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
 DATA_FILE  = os.path.join(_BASE, "data.json")
 ASSETS_DIR = os.path.join(_BASE, "assets")
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 DEFAULT_DATA = {
     "wasser_temp": "--",
@@ -1947,20 +1947,35 @@ class ControlPanel:
                     downloaded.append((name, new_path))
 
                 # Update-Batch schreiben
-                # timeout /t 8: genug Zeit damit PyInstaller-EXE sich vollständig
-                # entpackt hat und alle temp-Dateien freigegeben sind
+                # Wartet aktiv bis beide Prozesse wirklich beendet sind,
+                # dann noch 4 Sekunden für PyInstaller _MEI-Ordner-Cleanup
                 bat_path = os.path.join(app_dir, "badesee_update.bat")
+                steuerung = os.path.join(app_dir, "Badesee_Steuerung.exe")
                 lines = [
                     "@echo off",
-                    "echo Warte auf Programmende...",
-                    "timeout /t 8 /nobreak > nul",
+                    "echo Warte auf Prozessende...",
+                    # Warte bis Badesee_Steuerung.exe nicht mehr laeuft
+                    ":wait_steuerung",
+                    'tasklist /fi "imagename eq Badesee_Steuerung.exe" 2>nul'
+                    ' | find /i "Badesee_Steuerung.exe" >nul',
+                    "if not errorlevel 1 (",
+                    "    timeout /t 1 /nobreak > nul",
+                    "    goto wait_steuerung",
+                    ")",
+                    # Warte bis Badesee_Anzeige.exe nicht mehr laeuft
+                    ":wait_anzeige",
+                    'tasklist /fi "imagename eq Badesee_Anzeige.exe" 2>nul'
+                    ' | find /i "Badesee_Anzeige.exe" >nul',
+                    "if not errorlevel 1 (",
+                    "    timeout /t 1 /nobreak > nul",
+                    "    goto wait_anzeige",
+                    ")",
+                    # Extra-Puffer fuer PyInstaller _MEI-Ordner-Cleanup
+                    "timeout /t 4 /nobreak > nul",
                 ]
                 for name, new_path in downloaded:
                     orig = os.path.join(app_dir, name)
                     lines.append(f'move /y "{new_path}" "{orig}"')
-                steuerung = os.path.join(app_dir, "Badesee_Steuerung.exe")
-                # Weiteres Warten vor dem Start damit Temp-Ordner bereinigt ist
-                lines.append("timeout /t 3 /nobreak > nul")
                 lines.append(f'start "" "{steuerung}"')
                 lines.append('del "%~f0"')
                 with open(bat_path, "w", encoding="cp1252") as f:
