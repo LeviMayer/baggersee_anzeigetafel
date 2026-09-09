@@ -289,10 +289,6 @@ class DisplayApp:
         self.slide_frame.rowconfigure(0, weight=1)
         self.slide_label = tk.Label(self.slide_frame, bg="#000000")
         self.slide_label.grid(row=0, column=0, sticky="nsew")
-        fs_cap = max(16, self.screen_h // 54)
-        self.slide_caption = tk.Label(self.slide_frame, text="",
-                 bg="#000000", fg="#ffffff", font=("Segoe UI", fs_cap))
-        self.slide_caption.grid(row=1, column=0, pady=10)
 
     # ── Wetter-Bildschirm ─────────────────────────────────────────────────────
 
@@ -433,16 +429,14 @@ class DisplayApp:
         self.temp_frame.tkraise()
 
     def _show_slide(self, slide):
-        path    = os.path.join(ASSETS_DIR, slide.get("filename", ""))
-        caption = slide.get("caption", "")
-        photo   = self._load_slide_image(path)
+        path  = os.path.join(ASSETS_DIR, slide.get("filename", ""))
+        photo = self._load_slide_image(path)
         if photo:
             self.slide_label.config(image=photo)
             self.slide_label._image = photo
         else:
             self.slide_label.config(image="", text="Bild nicht gefunden",
                                     font=("Segoe UI", 30), fg="white")
-        self.slide_caption.config(text=caption)
         self.current_mode = "slide"
         self.slide_frame.tkraise()
 

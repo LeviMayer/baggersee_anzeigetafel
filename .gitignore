@@ -1,0 +1,14 @@
+# PyInstaller
+baggersee_display/build/
+baggersee_display/dist/
+baggersee_display/__pycache__/
+*.pyc
+*.spec
+
+# Laufzeit-Daten (werden lokal generiert)
+baggersee_display/data.json
+baggersee_display/assets/
+
+# Python venv
+venv/
+.venv/

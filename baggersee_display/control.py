@@ -34,6 +34,8 @@ DEFAULT_DATA = {
     "orientation": "landscape",
     "luft_source": "manual",
     "csv_path": "",
+    "wasser_source": "manual",
+    "wasser_csv_path": "",
     "email_enabled": False,
     "email_server": "imap.gmail.com",
     "email_port": 993,
@@ -44,6 +46,7 @@ DEFAULT_DATA = {
     "update_url": "",
     "slides": [],
     "last_updated": "",
+    "temp_log": [],
 }
 
 os.makedirs(ASSETS_DIR, exist_ok=True)
@@ -60,6 +63,13 @@ def load_data():
                 # Migrate old "usb" source value to "csv"
                 if d.get("luft_source") == "usb":
                     d["luft_source"] = "csv"
+                # Ensure new wasser sensor fields exist
+                if "wasser_source" not in d:
+                    d["wasser_source"] = "manual"
+                if "wasser_csv_path" not in d:
+                    d["wasser_csv_path"] = ""
+                if "temp_log" not in d:
+                    d["temp_log"] = []
                 return d
     except Exception:
         pass
@@ -82,13 +92,17 @@ class ControlPanel:
         self.data = load_data()
         self.display_processes = []
         self.thumb_cache = {}
-        self._sensor_running = False
-        self._email_running  = False
+        self._sensor_running        = False
+        self._wasser_sensor_running = False
+        self._email_running         = False
+        self.log_tree               = None
+        self._log_day_offset        = 0   # 0 = heute, 1 = gestern, …
 
         self._setup_styles()
         self._build_ui()
         self._refresh_ui()
         self._start_sensor_if_enabled()
+        self._start_wasser_sensor_if_enabled()
         self._start_email_if_enabled()
 
     def _setup_styles(self):
@@ -173,11 +187,14 @@ class ControlPanel:
         frame = self.tab_temp
         frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(3, weight=1)
 
         # Aktuelle Werte
         display_frame = tk.Frame(frame, bg="#313244", bd=0)
         display_frame.grid(row=0, column=0, columnspan=2, sticky="ew",
                            padx=20, pady=(20, 10))
+        display_frame.columnconfigure(0, weight=1)
+        display_frame.columnconfigure(1, weight=1)
         tk.Label(display_frame, text="Aktuell angezeigte Werte",
                  bg="#313244", fg="#89dceb",
                  font=("Segoe UI", 13, "bold")).grid(row=0, column=0, columnspan=2,
@@ -209,29 +226,51 @@ class ControlPanel:
         input_frame.columnconfigure(0, weight=1)
         input_frame.columnconfigure(1, weight=1)
 
-        # Wasser
+        # ── Wasser – mit Manuell/CSV-Toggle ──────────────────────────────────
         wl = tk.Frame(input_frame, bg="#0d2a4a", bd=0)
-        wl.grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=4)
-        tk.Label(wl, text="Wassertemperatur eingeben",
+        wl.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=4)
+
+        wasser_top = tk.Frame(wl, bg="#0d2a4a")
+        wasser_top.pack(fill="x", padx=16, pady=(14, 4))
+        tk.Label(wasser_top, text="Wassertemperatur",
                  bg="#0d2a4a", fg="#74c7ec",
-                 font=("Segoe UI", 11, "bold")).pack(pady=(14, 6), padx=16, anchor="w")
+                 font=("Segoe UI", 11, "bold")).pack(side="left")
 
-        w_entry_row = tk.Frame(wl, bg="#0d2a4a")
-        w_entry_row.pack(padx=16, pady=(0, 14), fill="x")
+        self.wasser_source_var = tk.StringVar(
+            value=self.data.get("wasser_source", "manual"))
+        tk.Radiobutton(wasser_top, text="Manuell",
+                       variable=self.wasser_source_var, value="manual",
+                       bg="#0d2a4a", fg="#cdd6f4", selectcolor="#1a3a5c",
+                       activebackground="#0d2a4a",
+                       font=("Segoe UI", 10),
+                       command=self._on_wasser_source_change
+                       ).pack(side="right", padx=(8, 0))
+        tk.Radiobutton(wasser_top, text="CSV-Sensor",
+                       variable=self.wasser_source_var, value="csv",
+                       bg="#0d2a4a", fg="#cdd6f4", selectcolor="#1a3a5c",
+                       activebackground="#0d2a4a",
+                       font=("Segoe UI", 10),
+                       command=self._on_wasser_source_change
+                       ).pack(side="right")
 
+        # Manuell-Bereich Wasser
+        self.wasser_manual_frame = tk.Frame(wl, bg="#0d2a4a")
+        self.wasser_manual_frame.pack(padx=16, fill="x")
+
+        w_entry_row = tk.Frame(self.wasser_manual_frame, bg="#0d2a4a")
+        w_entry_row.pack(pady=(0, 6), fill="x")
         self.wasser_var = tk.StringVar()
-        wasser_entry = tk.Entry(w_entry_row, textvariable=self.wasser_var,
-                                font=("Segoe UI", 28, "bold"),
-                                bg="#1a3a5c", fg="#29b6f6",
-                                insertbackground="#29b6f6",
-                                relief="flat", width=6,
-                                justify="center")
-        wasser_entry.pack(side="left")
+        tk.Entry(w_entry_row, textvariable=self.wasser_var,
+                 font=("Segoe UI", 28, "bold"),
+                 bg="#1a3a5c", fg="#29b6f6",
+                 insertbackground="#29b6f6",
+                 relief="flat", width=6,
+                 justify="center").pack(side="left")
         tk.Label(w_entry_row, text="°C", bg="#0d2a4a", fg="#4a7a9b",
                  font=("Segoe UI", 22)).pack(side="left", padx=8)
 
-        qb_w = tk.Frame(wl, bg="#0d2a4a")
-        qb_w.pack(padx=16, pady=(0, 14), fill="x")
+        qb_w = tk.Frame(self.wasser_manual_frame, bg="#0d2a4a")
+        qb_w.pack(pady=(0, 14), fill="x")
         for delta, label in [(-0.5, "−0.5"), (+0.5, "+0.5"), (+1, "+1"), (+2, "+2")]:
             tk.Button(qb_w, text=label,
                       bg="#1a3a5c", fg="#74c7ec",
@@ -240,9 +279,38 @@ class ControlPanel:
                       command=lambda d=delta: self._adjust_temp("wasser", d)
                       ).pack(side="left", padx=2)
 
-        # Luft – mit Manuell/CSV-Toggle
+        # CSV-Sensor-Bereich Wasser
+        self.wasser_csv_frame = tk.Frame(wl, bg="#0d2a4a")
+        self.wasser_csv_frame.pack(padx=16, fill="x")
+
+        wcsv_row = tk.Frame(self.wasser_csv_frame, bg="#0d2a4a")
+        wcsv_row.pack(fill="x", pady=(4, 4))
+        tk.Label(wcsv_row, text="CSV-Datei:",
+                 bg="#0d2a4a", fg="#bac2de",
+                 font=("Segoe UI", 10)).pack(side="left")
+        self.wasser_csv_path_var = tk.StringVar(
+            value=self.data.get("wasser_csv_path", ""))
+        tk.Entry(wcsv_row, textvariable=self.wasser_csv_path_var,
+                 bg="#1a3a5c", fg="#cdd6f4",
+                 insertbackground="#cdd6f4",
+                 relief="flat", font=("Segoe UI", 9), width=18
+                 ).pack(side="left", padx=6, fill="x", expand=True)
+        tk.Button(wcsv_row, text="Browse",
+                  bg="#1a3a5c", fg="#74c7ec",
+                  relief="flat", font=("Segoe UI", 10),
+                  padx=8, pady=2,
+                  command=self._browse_wasser_csv).pack(side="left")
+        self.wasser_csv_status_lbl = tk.Label(self.wasser_csv_frame,
+                 text="● Keine Datei ausgewählt",
+                 bg="#0d2a4a", fg="#6c7086",
+                 font=("Segoe UI", 10))
+        self.wasser_csv_status_lbl.pack(anchor="w", pady=(0, 14))
+
+        self._on_wasser_source_change()
+
+        # ── Luft – mit Manuell/CSV-Toggle ────────────────────────────────────
         ll = tk.Frame(input_frame, bg="#1a2a1a", bd=0)
-        ll.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
+        ll.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=4)
 
         luft_top = tk.Frame(ll, bg="#1a2a1a")
         luft_top.pack(fill="x", padx=16, pady=(14, 4))
@@ -267,7 +335,7 @@ class ControlPanel:
                        command=self._on_luft_source_change
                        ).pack(side="right")
 
-        # Manuell-Bereich
+        # Manuell-Bereich Luft
         self.luft_manual_frame = tk.Frame(ll, bg="#1a2a1a")
         self.luft_manual_frame.pack(padx=16, fill="x")
 
@@ -293,7 +361,7 @@ class ControlPanel:
                       command=lambda d=delta: self._adjust_temp("luft", d)
                       ).pack(side="left", padx=2)
 
-        # CSV-Sensor-Bereich
+        # CSV-Sensor-Bereich Luft
         self.luft_csv_frame = tk.Frame(ll, bg="#1a2a1a")
         self.luft_csv_frame.pack(padx=16, fill="x")
 
@@ -324,7 +392,7 @@ class ControlPanel:
 
         self._on_luft_source_change()
 
-        # Speichern-Button
+        # Speichern-Button (nur sichtbar wenn mindestens eine Quelle auf Manuell)
         save_btn = tk.Button(frame,
                              text="✓   Temperaturen speichern & anzeigen",
                              bg="#89b4fa", fg="#1e1e2e",
@@ -333,13 +401,76 @@ class ControlPanel:
                              cursor="hand2",
                              command=self._save_temps)
         save_btn.grid(row=2, column=0, columnspan=2,
-                      sticky="ew", padx=20, pady=16)
+                      sticky="ew", padx=20, pady=(4, 8))
 
-    # ── CSV-Sensor ────────────────────────────────────────────────────────────
+        # ── Temperatur-Protokoll ──────────────────────────────────────────────
+        log_frame = tk.Frame(frame, bg="#1e1e2e")
+        log_frame.grid(row=3, column=0, columnspan=2, sticky="nsew",
+                       padx=20, pady=(0, 16))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(1, weight=1)
+
+        # Navigation: ◀  Datum  ▶
+        nav = tk.Frame(log_frame, bg="#1e1e2e")
+        nav.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        nav.columnconfigure(1, weight=1)
+
+        self._nav_prev_btn = tk.Button(
+            nav, text="◀", bg="#45475a", fg="#cdd6f4",
+            font=("Segoe UI", 12, "bold"), relief="flat",
+            padx=10, pady=2,
+            command=lambda: self._nav_log(+1))   # +1 = älter
+        self._nav_prev_btn.grid(row=0, column=0, padx=(0, 8))
+
+        self._log_date_lbl = tk.Label(
+            nav, text="Tagesprotokoll",
+            bg="#1e1e2e", fg="#89dceb",
+            font=("Segoe UI", 13, "bold"), anchor="center")
+        self._log_date_lbl.grid(row=0, column=1, sticky="ew")
+
+        self._nav_next_btn = tk.Button(
+            nav, text="▶", bg="#45475a", fg="#cdd6f4",
+            font=("Segoe UI", 12, "bold"), relief="flat",
+            padx=10, pady=2,
+            command=lambda: self._nav_log(-1))   # -1 = neuer
+        self._nav_next_btn.grid(row=0, column=2, padx=(8, 0))
+
+        # Tabelle – zeigt immer nur einen Tag
+        cols = ("luft_10", "luft_12", "luft_14", "luft_16", "wasser", "wasser_time")
+        headings = ("Luft 10:00", "Luft 12:00", "Luft 14:00",
+                    "Luft 16:00", "Wasser", "Zeit Wasser")
+
+        style = ttk.Style()
+        style.configure("Log.Treeview",
+                        background="#313244", foreground="#cdd6f4",
+                        fieldbackground="#313244", rowheight=30,
+                        font=("Segoe UI", 11))
+        style.configure("Log.Treeview.Heading",
+                        background="#45475a", foreground="#89dceb",
+                        font=("Segoe UI", 10, "bold"))
+        style.map("Log.Treeview", background=[("selected", "#585b70")])
+
+        tree_frame = tk.Frame(log_frame, bg="#313244")
+        tree_frame.grid(row=1, column=0, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+
+        self.log_tree = ttk.Treeview(tree_frame, columns=cols,
+                                     show="headings", style="Log.Treeview",
+                                     height=2)
+        widths = [100, 100, 100, 100, 90, 100]
+        for col, head, w in zip(cols, headings, widths):
+            self.log_tree.heading(col, text=head)
+            self.log_tree.column(col, width=w, anchor="center", minwidth=70)
+
+        self.log_tree.grid(row=0, column=0, sticky="ew")
+
+        self._refresh_log_table()
+
+    # ── CSV-Sensor (Luft) ─────────────────────────────────────────────────────
 
     def _browse_csv(self):
         path = filedialog.askopenfilename(
-            title="CSV-Datei auswählen",
+            title="CSV-Datei für Lufttemperatur auswählen",
             filetypes=[("CSV-Dateien", "*.csv"), ("Alle Dateien", "*.*")]
         )
         if path:
@@ -380,6 +511,129 @@ class ControlPanel:
 
     def _stop_sensor_reading(self):
         self._sensor_running = False
+
+    # ── CSV-Sensor (Wasser) ───────────────────────────────────────────────────
+
+    def _browse_wasser_csv(self):
+        path = filedialog.askopenfilename(
+            title="CSV-Datei für Wassertemperatur auswählen",
+            filetypes=[("CSV-Dateien", "*.csv"), ("Alle Dateien", "*.*")]
+        )
+        if path:
+            self.wasser_csv_path_var.set(path)
+            self._save_wasser_sensor_settings()
+            if self.wasser_source_var.get() == "csv":
+                self._stop_wasser_sensor_reading()
+                self._start_wasser_sensor_reading()
+
+    def _on_wasser_source_change(self):
+        src = self.wasser_source_var.get()
+        if src == "csv":
+            self.wasser_manual_frame.pack_forget()
+            self.wasser_csv_frame.pack(padx=16, fill="x")
+            self._save_wasser_sensor_settings()
+            self._start_wasser_sensor_reading()
+        else:
+            self.wasser_csv_frame.pack_forget()
+            self.wasser_manual_frame.pack(padx=16, fill="x")
+            self._stop_wasser_sensor_reading()
+            self._save_wasser_sensor_settings()
+
+    def _save_wasser_sensor_settings(self):
+        self.data = load_data()
+        self.data["wasser_source"]   = self.wasser_source_var.get()
+        self.data["wasser_csv_path"] = self.wasser_csv_path_var.get()
+        save_data(self.data)
+
+    def _start_wasser_sensor_if_enabled(self):
+        if self.data.get("wasser_source", "manual") == "csv":
+            self._start_wasser_sensor_reading()
+
+    def _start_wasser_sensor_reading(self):
+        if self._wasser_sensor_running:
+            return
+        self._wasser_sensor_running = True
+        threading.Thread(target=self._wasser_csv_reader, daemon=True).start()
+
+    def _stop_wasser_sensor_reading(self):
+        self._wasser_sensor_running = False
+
+    def _wasser_csv_reader(self):
+        last_mtime = None
+        MAX_LINES  = 500
+
+        while self._wasser_sensor_running:
+            self.data = load_data()
+            csv_path  = self.data.get("wasser_csv_path", "")
+
+            if not csv_path:
+                self.root.after(0, lambda: self.wasser_csv_status_lbl.config(
+                    text="● Keine Datei ausgewählt", fg="#6c7086"))
+                time.sleep(5)
+                continue
+
+            if not os.path.exists(csv_path):
+                self.root.after(0, lambda p=csv_path: self.wasser_csv_status_lbl.config(
+                    text=f"● Datei nicht gefunden: {os.path.basename(p)}", fg="#f38ba8"))
+                time.sleep(5)
+                continue
+
+            try:
+                mtime = os.path.getmtime(csv_path)
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+                        raw_lines = f.readlines()
+
+                    non_empty = [l.rstrip("\r\n") for l in raw_lines if l.strip()]
+
+                    if len(non_empty) > MAX_LINES:
+                        kept = non_empty[-MAX_LINES:]
+                        try:
+                            with open(csv_path, "w", encoding="utf-8") as f:
+                                f.write("\n".join(kept) + "\n")
+                            non_empty = kept
+                        except Exception:
+                            pass
+
+                    val = None
+                    for line in reversed(non_empty):
+                        parts = [p.strip() for p in line.split(",")]
+                        parts = [p for p in parts if p]
+                        if not parts:
+                            continue
+                        value_parts = (parts[1:] if len(parts) > 1 and
+                                       re.match(r'\d{4}-\d{2}-\d{2}', parts[0])
+                                       else parts)
+                        combined = ",".join(value_parts)
+                        combined = re.sub(r'(\d),(\d)', r'\1.\2', combined)
+                        nums = re.findall(r'-?\d+\.?\d*', combined)
+                        if nums:
+                            candidate = float(nums[0])
+                            if -10 <= candidate <= 50:
+                                val = candidate
+                                break
+
+                    if val is not None:
+                        d = load_data()
+                        d["wasser_temp"]   = f"{val:.1f}".rstrip("0").rstrip(".")
+                        d["last_updated"]  = datetime.now().isoformat()
+                        save_data(d)
+                        ts = datetime.now().strftime("%H:%M")
+                        self.root.after(0, lambda v=val, t=ts, c=len(non_empty):
+                            self.wasser_csv_status_lbl.config(
+                                text=f"● Aktiv  |  {v:.1f}°C  ·  {t} Uhr  ({c} Einträge)",
+                                fg="#74c7ec"))
+                        self.root.after(0, lambda v=val: self._log_temp("wasser", v))
+                    else:
+                        self.root.after(0, lambda: self.wasser_csv_status_lbl.config(
+                            text="● Kein gültiger Temperaturwert gefunden", fg="#f9e2af"))
+
+            except Exception as e:
+                self.root.after(0, lambda err=str(e): self.wasser_csv_status_lbl.config(
+                    text=f"● Fehler: {err[:60]}", fg="#f38ba8"))
+
+            time.sleep(5)
 
     def _csv_reader(self):
         last_mtime = None
@@ -456,6 +710,11 @@ class ControlPanel:
                             self.csv_status_lbl.config(
                                 text=f"● Aktiv  |  {v:.1f}°C  ·  {t} Uhr  ({c} Einträge)",
                                 fg="#a6e3a1"))
+                        # Zeitslot-Protokollierung (10/12/14/16 Uhr ± 20 Min.)
+                        slot = self._current_luft_slot()
+                        if slot:
+                            self.root.after(0, lambda v=val, s=slot:
+                                self._log_temp(s, v))
                     else:
                         self.root.after(0, lambda: self.csv_status_lbl.config(
                             text="● Kein gültiger Temperaturwert gefunden", fg="#f9e2af"))
@@ -465,6 +724,121 @@ class ControlPanel:
                     text=f"● Fehler: {err[:60]}", fg="#f38ba8"))
 
             time.sleep(5)
+
+    @staticmethod
+    def _current_luft_slot():
+        """Gibt 'luft_10', 'luft_12', 'luft_14' oder 'luft_16' zurück,
+        wenn die aktuelle Uhrzeit ± 20 Minuten um eine der Messzeiten liegt."""
+        now = datetime.now()
+        total_min = now.hour * 60 + now.minute
+        for slot_hour in [10, 12, 14, 16]:
+            if abs(total_min - slot_hour * 60) <= 20:
+                return f"luft_{slot_hour:02d}"
+        return None
+
+    def _log_temp(self, field, value):
+        """Trägt einen Temperaturwert in das Tagesprotokoll ein.
+        field: 'luft_10', 'luft_12', 'luft_14', 'luft_16' oder 'wasser'
+        Luft-Slots werden nur einmal pro Tag gesetzt."""
+        d = load_data()
+        today = datetime.now().strftime("%Y-%m-%d")
+        log   = d.get("temp_log", [])
+
+        entry = next((e for e in log if e.get("date") == today), None)
+        if entry is None:
+            entry = {
+                "date": today,
+                "luft_10": None, "luft_12": None,
+                "luft_14": None, "luft_16": None,
+                "wasser": None,  "wasser_time": None,
+            }
+            log.insert(0, entry)
+
+        if field.startswith("luft_") and entry.get(field) is not None:
+            return  # Slot für heute bereits eingetragen
+
+        val_str = f"{value:.1f}".rstrip("0").rstrip(".")
+        if field == "wasser":
+            entry["wasser"]      = val_str
+            entry["wasser_time"] = datetime.now().strftime("%H:%M")
+        else:
+            entry[field] = val_str
+
+        # Maximal 7 Tage aufbewahren
+        log = sorted(log, key=lambda e: e.get("date", ""), reverse=True)[:7]
+        d["temp_log"] = log
+        save_data(d)
+        self.data = d
+        self._refresh_log_table()
+
+    def _nav_log(self, direction):
+        """direction: +1 = einen Tag älter, -1 = einen Tag neuer."""
+        log = self.data.get("temp_log", [])
+        log_sorted = sorted(log, key=lambda e: e.get("date", ""), reverse=True)
+        max_offset = max(0, len(log_sorted) - 1)
+        self._log_day_offset = max(0, min(max_offset, self._log_day_offset + direction))
+        self._refresh_log_table()
+
+    def _refresh_log_table(self):
+        if self.log_tree is None:
+            return
+
+        self.data = load_data()
+        log = self.data.get("temp_log", [])
+        log_sorted = sorted(log, key=lambda e: e.get("date", ""), reverse=True)
+
+        # Offset sicher halten
+        max_offset = max(0, len(log_sorted) - 1)
+        self._log_day_offset = min(self._log_day_offset, max_offset)
+
+        # Nav-Buttons aktualisieren
+        prev_state = "normal" if self._log_day_offset < max_offset else "disabled"
+        next_state = "normal" if self._log_day_offset > 0 else "disabled"
+        try:
+            self._nav_prev_btn.config(state=prev_state)
+            self._nav_next_btn.config(state=next_state)
+        except Exception:
+            pass
+
+        # Datumsbeschriftung
+        if log_sorted:
+            entry = log_sorted[self._log_day_offset]
+            raw_date = entry.get("date", "")
+            try:
+                dt = datetime.strptime(raw_date, "%Y-%m-%d")
+                weekdays = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+                wd = weekdays[dt.weekday()]
+                disp_date = dt.strftime(f"{wd}, %d.%m.%Y")
+                if self._log_day_offset == 0:
+                    disp_date = f"Heute  –  {disp_date}"
+                elif self._log_day_offset == 1:
+                    disp_date = f"Gestern  –  {disp_date}"
+            except Exception:
+                disp_date = raw_date
+        else:
+            entry     = {}
+            disp_date = "Noch keine Einträge"
+
+        try:
+            self._log_date_lbl.config(text=disp_date)
+        except Exception:
+            pass
+
+        # Treeview befüllen
+        for row in self.log_tree.get_children():
+            self.log_tree.delete(row)
+
+        def fmt(v):
+            return f"{v}°C" if v else "--"
+
+        self.log_tree.insert("", "end", values=(
+            fmt(entry.get("luft_10")),
+            fmt(entry.get("luft_12")),
+            fmt(entry.get("luft_14")),
+            fmt(entry.get("luft_16")),
+            fmt(entry.get("wasser")),
+            entry.get("wasser_time") or "--",
+        ))
 
     def _adjust_temp(self, field, delta):
         var = self.wasser_var if field == "wasser" else self.luft_var
@@ -482,15 +856,21 @@ class ControlPanel:
         wt = self.wasser_var.get().strip().replace(",", ".")
         lt = self.luft_var.get().strip().replace(",", ".")
 
-        if not wt and not lt:
+        # Bei CSV-Quellen müssen die entsprechenden Felder nicht manuell gefüllt sein
+        wasser_is_manual = self.wasser_source_var.get() == "manual"
+        luft_is_manual   = self.luft_source_var.get()   == "manual"
+
+        if wasser_is_manual and luft_is_manual and not wt and not lt:
             messagebox.showwarning("Eingabe fehlt",
                                    "Bitte mindestens eine Temperatur eingeben.")
             return
 
         self.data = load_data()
+        wasser_val = None
         if wt:
             try:
                 v = float(wt)
+                wasser_val = v
                 self.data["wasser_temp"] = f"{v:.1f}".rstrip("0").rstrip(".")
             except ValueError:
                 messagebox.showerror("Ungültige Eingabe",
@@ -507,6 +887,9 @@ class ControlPanel:
 
         self.data["last_updated"] = datetime.now().isoformat()
         save_data(self.data)
+        # Wassertemperatur ins Tagesprotokoll eintragen
+        if wasser_val is not None:
+            self._log_temp("wasser", wasser_val)
         self._refresh_ui()
         self._flash_saved()
 
@@ -1174,6 +1557,7 @@ class ControlPanel:
         import email as email_lib
         import email.header
         import tempfile
+        import socket
 
         d      = load_data()
         server = d.get("email_server", "")
@@ -1185,64 +1569,199 @@ class ControlPanel:
         if not server or not user or not pw:
             return
 
-        try:
-            with imaplib.IMAP4_SSL(server, port) as imap:
-                imap.login(user, pw)
-                imap.select(folder)
-                typ, msgs = imap.search(None, "UNSEEN")
-                if typ != "OK" or not msgs[0]:
-                    return
+        # Globalen Socket-Timeout für langsame Verbindungen erhöhen
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(60)
 
-                for msg_id in msgs[0].split():
-                    typ, data = imap.fetch(msg_id, "(RFC822)")
-                    if typ != "OK":
+        pending = []  # [(sender, filename, tmp_path)] – erst sammeln, dann anzeigen
+
+        try:
+            imap = imaplib.IMAP4_SSL(server, port)
+            imap.login(user, pw)
+            imap.select(folder)
+
+            # ALLE Mails prüfen, nicht nur ungelesene
+            typ, msgs = imap.search(None, "ALL")
+            if typ != "OK" or not msgs[0]:
+                imap.logout()
+                return
+
+            to_delete = []
+
+            for msg_id in msgs[0].split():
+                typ, data = imap.fetch(msg_id, "(RFC822)")
+                if typ != "OK":
+                    continue
+
+                msg    = email_lib.message_from_bytes(data[0][1])
+                sender = msg.get("From", "Unbekannt")
+                has_image = False
+
+                for part in msg.walk():
+                    ct = part.get_content_type()
+                    is_image = ct.startswith("image/")
+                    is_pdf   = ct == "application/pdf"
+                    if not is_image and not is_pdf:
                         continue
 
-                    msg    = email_lib.message_from_bytes(data[0][1])
-                    sender = msg.get("From", "Unbekannt")
-                    found_image = False
+                    raw_name = part.get_filename()
+                    if not raw_name:
+                        raw_name = "email_bild.pdf" if is_pdf else f"email_bild.{ct.split('/')[-1]}"
 
-                    for part in msg.walk():
-                        ct = part.get_content_type()
-                        if not ct.startswith("image/"):
-                            continue
+                    decoded = email_lib.header.decode_header(raw_name)[0]
+                    if isinstance(decoded[0], bytes):
+                        filename = decoded[0].decode(decoded[1] or "utf-8", errors="replace")
+                    else:
+                        filename = decoded[0]
 
-                        raw_name = part.get_filename()
-                        if not raw_name:
-                            ext = ct.split("/")[-1]
-                            raw_name = f"email_bild.{ext}"
+                    payload = part.get_payload(decode=True)
+                    if not payload:
+                        continue
 
-                        decoded = email_lib.header.decode_header(raw_name)[0]
-                        if isinstance(decoded[0], bytes):
-                            filename = decoded[0].decode(decoded[1] or "utf-8", errors="replace")
-                        else:
-                            filename = decoded[0]
+                    tmp_path = os.path.join(tempfile.gettempdir(), filename)
+                    with open(tmp_path, "wb") as f:
+                        f.write(payload)
 
-                        payload = part.get_payload(decode=True)
-                        if not payload:
-                            continue
+                    if is_pdf:
+                        # Jede PDF-Seite als PNG-Bild extrahieren
+                        for pg_sender, pg_name, pg_path in self._pdf_to_images(
+                                tmp_path, filename, sender):
+                            pending.append((pg_sender, pg_name, pg_path))
+                    else:
+                        pending.append((sender, filename, tmp_path))
+                    has_image = True
 
-                        tmp_path = os.path.join(tempfile.gettempdir(), filename)
-                        with open(tmp_path, "wb") as f:
-                            f.write(payload)
+                if has_image:
+                    to_delete.append(msg_id)
 
-                        found_image = True
-                        self.root.after(0, lambda s=sender, fn=filename, tp=tmp_path:
-                            self._confirm_email_image(s, fn, tp))
+            # Mails vom Server löschen
+            for msg_id in to_delete:
+                try:
+                    imap.store(msg_id, "+FLAGS", "\\Deleted")
+                except Exception:
+                    pass
+            if to_delete:
+                imap.expunge()
 
-                    if found_image:
-                        imap.store(msg_id, "+FLAGS", "\\Seen")
+            imap.logout()
 
         except Exception as e:
             print(f"[EMAIL] Fehler: {e}")
             self.root.after(0, lambda err=str(e): self.email_status_lbl.config(
-                text=f"✕  Fehler beim Prüfen: {err[:80]}", fg="#f38ba8"))
+                text=f"✕  Fehler: {err[:80]}", fg="#f38ba8"))
+        finally:
+            socket.setdefaulttimeout(old_timeout)
+
+        # Bestätigungs-Popups sequenziell im Hauptthread zeigen
+        if pending:
+            self.root.after(0, lambda: self._next_email_confirm(pending))
+
+    def _next_email_confirm(self, queue):
+        if not queue:
+            return
+        sender, filename, tmp_path = queue[0]
+        self._confirm_email_image(sender, filename, tmp_path)
+        # Nach dem Schließen des Dialogs nächstes Bild zeigen
+        self.root.after(200, lambda: self._next_email_confirm(queue[1:]))
+
+    def _pdf_to_images(self, pdf_path, pdf_filename, sender):
+        """Konvertiert jede PDF-Seite in eine PNG-Datei. Gibt Liste von (sender, name, path) zurück."""
+        import tempfile
+        results = []
+        try:
+            import fitz  # PyMuPDF
+        except ImportError:
+            print("[EMAIL] PyMuPDF nicht installiert – PDF wird übersprungen. "
+                  "Bitte 'pip install PyMuPDF' ausführen.")
+            return results
+
+        try:
+            doc  = fitz.open(pdf_path)
+            base = os.path.splitext(pdf_filename)[0]
+            mat  = fitz.Matrix(2.0, 2.0)  # 2× Zoom → ca. 144 dpi
+
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                pix  = page.get_pixmap(matrix=mat, alpha=False)
+                if len(doc) == 1:
+                    out_name = f"{base}.png"
+                else:
+                    out_name = f"{base}_Seite{page_num + 1}.png"
+                out_path = os.path.join(tempfile.gettempdir(), out_name)
+                pix.save(out_path)
+                results.append((sender, out_name, out_path))
+            doc.close()
+        except Exception as e:
+            print(f"[EMAIL] PDF-Konvertierung fehlgeschlagen: {e}")
+        return results
 
     def _confirm_email_image(self, sender, filename, tmp_path):
-        if not messagebox.askyesno(
-            "Neues Bild per E-Mail",
-            f"Von: {sender}\nDatei: {filename}\n\nDieses Bild zur Slideshow hinzufügen?"
-        ):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Neues Bild per E-Mail")
+        dialog.configure(bg="#1e1e2e")
+        dialog.grab_set()
+        dialog.transient(self.root)
+        dialog.resizable(True, True)
+
+        # Bildvorschau
+        try:
+            img = Image.open(tmp_path)
+            img.thumbnail((480, 340), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            img_lbl = tk.Label(dialog, image=photo, bg="#1e1e2e")
+            img_lbl.image = photo
+            img_lbl.pack(padx=20, pady=(20, 8))
+            dim_text = f"{img.width}×{img.height} px  ·  {os.path.splitext(filename)[1].upper()}"
+        except Exception:
+            tk.Label(dialog, text="[Vorschau nicht verfügbar]",
+                     bg="#313244", fg="#6c7086",
+                     font=("Segoe UI", 12),
+                     width=40, height=8).pack(padx=20, pady=(20, 8))
+            dim_text = ""
+
+        # Absender-Info
+        info = tk.Frame(dialog, bg="#313244")
+        info.pack(fill="x", padx=20, pady=4)
+        tk.Label(info, text=f"Von:    {sender}",
+                 bg="#313244", fg="#cdd6f4",
+                 font=("Segoe UI", 11), anchor="w").pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(info, text=f"Datei:  {filename}",
+                 bg="#313244", fg="#89b4fa",
+                 font=("Segoe UI", 11), anchor="w").pack(fill="x", padx=12, pady=(2, 2))
+        if dim_text:
+            tk.Label(info, text=dim_text,
+                     bg="#313244", fg="#6c7086",
+                     font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=12, pady=(0, 8))
+
+        tk.Label(dialog, text="Dieses Bild zur Slideshow hinzufügen?",
+                 bg="#1e1e2e", fg="#cdd6f4",
+                 font=("Segoe UI", 12, "bold")).pack(pady=(12, 6))
+
+        result = [False]
+
+        def yes():
+            result[0] = True
+            dialog.destroy()
+
+        def no():
+            dialog.destroy()
+
+        btn_row = tk.Frame(dialog, bg="#1e1e2e")
+        btn_row.pack(pady=(0, 20))
+        tk.Button(btn_row, text="✓  Ja, hinzufügen",
+                  bg="#a6e3a1", fg="#1e1e2e",
+                  font=("Segoe UI", 12, "bold"),
+                  relief="flat", padx=16, pady=8,
+                  command=yes).pack(side="left", padx=(0, 8))
+        tk.Button(btn_row, text="✕  Ablehnen",
+                  bg="#f38ba8", fg="#1e1e2e",
+                  font=("Segoe UI", 12, "bold"),
+                  relief="flat", padx=16, pady=8,
+                  command=no).pack(side="left")
+
+        dialog.wait_window()
+
+        if not result[0]:
             return
 
         dest_name = filename
@@ -1295,9 +1814,8 @@ class ControlPanel:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
 
-            # GitHub Releases API format: {"tag_name": "v1.2.0", "html_url": "..."}
             remote_version = data.get("tag_name", data.get("version", "")).lstrip("v")
-            download_url   = data.get("html_url", data.get("download_url", url))
+            fallback_url   = data.get("html_url", data.get("download_url", url))
 
             if not remote_version:
                 self.root.after(0, lambda: self.update_status_lbl.config(
@@ -1310,23 +1828,168 @@ class ControlPanel:
                 except Exception:
                     return (0,)
 
-            if _vt(remote_version) > _vt(APP_VERSION):
-                msg = (f"Neue Version verfügbar: v{remote_version}\n"
-                       f"(Aktuell: v{APP_VERSION})\n\n"
-                       f"Download: {download_url}\n\n"
-                       f"Bitte die neue EXE herunterladen und ersetzen.")
-                self.root.after(0, lambda m=msg: (
-                    self.update_status_lbl.config(
-                        text=f"⬆  Neue Version: v{remote_version}", fg="#f9e2af"),
-                    messagebox.showinfo("Update verfügbar", m)
-                ))
-            else:
+            if _vt(remote_version) <= _vt(APP_VERSION):
                 self.root.after(0, lambda rv=remote_version: self.update_status_lbl.config(
                     text=f"✓  Aktuell  ·  Neueste Version: v{rv}", fg="#a6e3a1"))
+                return
+
+            # Neue Version gefunden – EXE-Assets aus dem Release suchen
+            exe_assets = [
+                (a["name"], a["browser_download_url"])
+                for a in data.get("assets", [])
+                if a.get("name", "").lower().endswith(".exe")
+            ]
+
+            self.root.after(0, lambda rv=remote_version, fu=fallback_url, ea=exe_assets:
+                self._show_update_dialog(rv, fu, ea))
 
         except Exception as e:
             self.root.after(0, lambda err=str(e): self.update_status_lbl.config(
                 text=f"✕  Fehler: {err[:80]}", fg="#f38ba8"))
+
+    def _show_update_dialog(self, remote_version, fallback_url, exe_assets):
+        self.update_status_lbl.config(
+            text=f"⬆  Neue Version: v{remote_version}", fg="#f9e2af")
+
+        is_exe = getattr(sys, "frozen", False)
+        if is_exe and exe_assets:
+            names = "\n".join(f"  • {n}" for n, _ in exe_assets)
+            answer = messagebox.askyesno(
+                "Update verfügbar",
+                f"Neue Version: v{remote_version}  (aktuell: v{APP_VERSION})\n\n"
+                f"Folgende Dateien werden heruntergeladen:\n{names}\n\n"
+                f"Automatisch herunterladen und installieren?"
+            )
+            if answer:
+                self._start_auto_update(exe_assets)
+        else:
+            messagebox.showinfo(
+                "Update verfügbar",
+                f"Neue Version: v{remote_version}  (aktuell: v{APP_VERSION})\n\n"
+                f"Download: {fallback_url}\n\n"
+                f"EXE-Dateien manuell ersetzen und App neu starten."
+            )
+
+    def _start_auto_update(self, exe_assets):
+        # Fortschritts-Dialog
+        prog = tk.Toplevel(self.root)
+        prog.title("Update wird heruntergeladen …")
+        prog.geometry("420x160")
+        prog.configure(bg="#1e1e2e")
+        prog.grab_set()
+        prog.transient(self.root)
+        prog.resizable(False, False)
+
+        status_lbl = tk.Label(prog, text="Vorbereitung …",
+                              bg="#1e1e2e", fg="#cdd6f4",
+                              font=("Segoe UI", 12, "bold"))
+        status_lbl.pack(pady=(28, 6), padx=20)
+
+        detail_lbl = tk.Label(prog, text="",
+                              bg="#1e1e2e", fg="#6c7086",
+                              font=("Segoe UI", 10))
+        detail_lbl.pack()
+
+        app_dir = os.path.dirname(sys.executable)
+
+        def download_thread():
+            downloaded = []
+            try:
+                for idx, (name, dl_url) in enumerate(exe_assets):
+                    prog.after(0, lambda n=name, i=idx, t=len(exe_assets):
+                        status_lbl.config(text=f"({i+1}/{t})  {n}"))
+
+                    new_path = os.path.join(app_dir, name + ".new")
+
+                    # Bis zu 3 Versuche bei langsamer/instabiler Verbindung
+                    last_err = None
+                    for attempt in range(3):
+                        try:
+                            if attempt > 0:
+                                prog.after(0, lambda a=attempt:
+                                    detail_lbl.config(text=f"Versuch {a+1}/3 …"))
+                                time.sleep(5)
+
+                            req = urllib.request.Request(
+                                dl_url, headers={"User-Agent": "BadeseeAnzeigetafel"})
+                            # timeout=300: 5 Minuten pro Daten-Paket – für sehr langsame Verbindungen
+                            with urllib.request.urlopen(req, timeout=300) as resp:
+                                total = int(resp.headers.get("Content-Length", 0))
+                                done  = 0
+                                with open(new_path, "wb") as f:
+                                    while True:
+                                        chunk = resp.read(8192)  # kleinere Chunks für langsame Leitungen
+                                        if not chunk:
+                                            break
+                                        f.write(chunk)
+                                        done += len(chunk)
+                                        if total:
+                                            pct = done * 100 // total
+                                            mb  = done / 1_048_576
+                                            prog.after(0, lambda p=pct, m=mb:
+                                                detail_lbl.config(text=f"{m:.1f} MB  ({p}%)"))
+                            last_err = None
+                            break  # Erfolg
+                        except Exception as e:
+                            last_err = e
+
+                    if last_err:
+                        raise last_err
+
+                    # Integritätsprüfung: Windows-EXE beginnt mit "MZ"
+                    with open(new_path, "rb") as f:
+                        header = f.read(2)
+                    if header != b"MZ":
+                        raise ValueError(
+                            f"{name}: Heruntergeladene Datei ist keine gültige EXE "
+                            f"(Header: {header!r}). Bitte Upload auf GitHub prüfen.")
+
+                    downloaded.append((name, new_path))
+
+                # Update-Batch schreiben
+                # timeout /t 8: genug Zeit damit PyInstaller-EXE sich vollständig
+                # entpackt hat und alle temp-Dateien freigegeben sind
+                bat_path = os.path.join(app_dir, "badesee_update.bat")
+                lines = [
+                    "@echo off",
+                    "echo Warte auf Programmende...",
+                    "timeout /t 8 /nobreak > nul",
+                ]
+                for name, new_path in downloaded:
+                    orig = os.path.join(app_dir, name)
+                    lines.append(f'move /y "{new_path}" "{orig}"')
+                steuerung = os.path.join(app_dir, "Badesee_Steuerung.exe")
+                # Weiteres Warten vor dem Start damit Temp-Ordner bereinigt ist
+                lines.append("timeout /t 3 /nobreak > nul")
+                lines.append(f'start "" "{steuerung}"')
+                lines.append('del "%~f0"')
+                with open(bat_path, "w", encoding="cp1252") as f:
+                    f.write("\r\n".join(lines))
+
+                prog.after(0, lambda bp=bat_path: self._finish_auto_update(prog, bp))
+
+            except Exception as e:
+                prog.after(0, lambda err=str(e): (
+                    status_lbl.config(text="Fehler beim Download", fg="#f38ba8"),
+                    detail_lbl.config(text=err[:80])
+                ))
+
+        threading.Thread(target=download_thread, daemon=True).start()
+
+    def _finish_auto_update(self, prog_dialog, bat_path):
+        prog_dialog.destroy()
+        if messagebox.askyesno(
+            "Update bereit",
+            "Download abgeschlossen!\n\n"
+            "Die App wird jetzt beendet, das Update installiert\n"
+            "und danach automatisch neu gestartet.\n\n"
+            "Jetzt installieren?"
+        ):
+            self._stop_displays()
+            subprocess.Popen(bat_path, shell=True,
+                             creationflags=subprocess.CREATE_NO_WINDOW
+                             if sys.platform == "win32" else 0)
+            self.root.after(600, self.root.destroy)
 
     # ── Display starten/stoppen ───────────────────────────────────────────────
 
@@ -1404,9 +2067,16 @@ class ControlPanel:
     def _stop_displays(self):
         for proc in self.display_processes:
             try:
-                proc.terminate()
-            except Exception:
-                pass
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        capture_output=True, timeout=5
+                    )
+                else:
+                    proc.terminate()
+            except Exception as e:
+                print(f"[DEBUG] Beenden Fehler: {e}")
         self.display_processes.clear()
 
     # ── Refresh ───────────────────────────────────────────────────────────────
@@ -1429,6 +2099,7 @@ class ControlPanel:
             except Exception:
                 pass
 
+        self._refresh_log_table()
         self.root.after(5000, self._refresh_ui)
 
 
