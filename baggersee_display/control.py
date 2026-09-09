@@ -22,7 +22,7 @@ _BASE = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
 DATA_FILE  = os.path.join(_BASE, "data.json")
 ASSETS_DIR = os.path.join(_BASE, "assets")
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 DEFAULT_DATA = {
     "wasser_temp": "--",
