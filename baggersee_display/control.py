@@ -22,7 +22,7 @@ _BASE = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
 DATA_FILE  = os.path.join(_BASE, "data.json")
 ASSETS_DIR = os.path.join(_BASE, "assets")
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 DEFAULT_DATA = {
     "wasser_temp": "--",
@@ -2058,17 +2058,29 @@ class ControlPanel:
         self._stop_displays()
         indices = self._get_display_monitor_indices()
 
+        # Einstellung "Anzahl Bildschirme" als Obergrenze
+        max_displays = max(1, self.data.get("monitor_count", 2) - 1)
+        indices = indices[:max_displays]
+
         if getattr(sys, "frozen", False):
             anzeige_exe = os.path.join(os.path.dirname(sys.executable),
                                        "Badesee_Anzeige.exe")
+            if not os.path.isfile(anzeige_exe):
+                messagebox.showerror("Fehler",
+                                     f"Badesee_Anzeige.exe nicht gefunden:\n{anzeige_exe}")
+                return
             def make_cmd(i): return [anzeige_exe, str(i)]
         else:
             script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "display.py")
             def make_cmd(i): return [sys.executable, script, str(i)]
 
-        for i in indices:
+        for idx, i in enumerate(indices):
             try:
+                # PyInstaller --onefile: zweite Instanz braucht Zeit zum Entpacken,
+                # deshalb 1,5 s zwischen jedem Start
+                if idx > 0:
+                    time.sleep(1.5)
                 proc = subprocess.Popen(
                     make_cmd(i),
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -2077,7 +2089,7 @@ class ControlPanel:
                 print(f"[DEBUG] Prozess für Monitor {i} gestartet (PID {proc.pid})")
             except Exception as e:
                 messagebox.showerror("Fehler",
-                                     f"Anzeige {i+1} konnte nicht gestartet werden:\n{e}")
+                                     f"Anzeige {idx+1} konnte nicht gestartet werden:\n{e}")
 
     def _stop_displays(self):
         for proc in self.display_processes:
@@ -2121,6 +2133,8 @@ class ControlPanel:
 def main():
     root = tk.Tk()
     app = ControlPanel(root)
+    root.protocol("WM_DELETE_WINDOW",
+                  lambda: (app._stop_displays(), root.destroy()))
     root.mainloop()
 
 
