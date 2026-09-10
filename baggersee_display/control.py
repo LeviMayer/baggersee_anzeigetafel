@@ -22,7 +22,7 @@ _BASE = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
 DATA_FILE  = os.path.join(_BASE, "data.json")
 ASSETS_DIR = os.path.join(_BASE, "assets")
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 
 DEFAULT_DATA = {
     "wasser_temp": "--",
@@ -1918,7 +1918,7 @@ class ControlPanel:
                                 done  = 0
                                 with open(new_path, "wb") as f:
                                     while True:
-                                        chunk = resp.read(8192)  # kleinere Chunks für langsame Leitungen
+                                        chunk = resp.read(65536)  # 64 KB Chunks
                                         if not chunk:
                                             break
                                         f.write(chunk)
@@ -1928,58 +1928,77 @@ class ControlPanel:
                                             mb  = done / 1_048_576
                                             prog.after(0, lambda p=pct, m=mb:
                                                 detail_lbl.config(text=f"{m:.1f} MB  ({p}%)"))
+                            # Vollständigkeits-Check: Verbindung kann sauber schliessen
+                            # bevor alle Bytes übertragen sind – kein Exception aber Datei abgeschnitten
+                            if total and done != total:
+                                raise ValueError(
+                                    f"{name}: Download abgebrochen nach {done/1_048_576:.1f} MB "
+                                    f"von {total/1_048_576:.1f} MB – wird erneut versucht.")
                             last_err = None
                             break  # Erfolg
                         except Exception as e:
                             last_err = e
+                            # Abgebrochene Datei löschen damit kein korruptes File bleibt
+                            try:
+                                os.remove(new_path)
+                            except OSError:
+                                pass
 
                     if last_err:
                         raise last_err
 
-                    # Integritätsprüfung: Windows-EXE beginnt mit "MZ"
+                    # Integritätsprüfung 1: Windows-EXE beginnt mit "MZ"
+                    # Integritätsprüfung 2: PE-Signatur an Offset 0x3C prüfen (vollständiger Header)
                     with open(new_path, "rb") as f:
-                        header = f.read(2)
-                    if header != b"MZ":
+                        header = f.read(256)
+                    if len(header) < 2 or header[:2] != b"MZ":
                         raise ValueError(
-                            f"{name}: Heruntergeladene Datei ist keine gültige EXE "
-                            f"(Header: {header!r}). Bitte Upload auf GitHub prüfen.")
+                            f"{name}: Keine gültige EXE (kein MZ-Header). "
+                            f"Download möglicherweise unvollständig.")
+                    if len(header) >= 64:
+                        pe_offset = int.from_bytes(header[60:64], "little")
+                        if pe_offset < len(header) and header[pe_offset:pe_offset+2] != b"PE":
+                            raise ValueError(
+                                f"{name}: Keine gültige PE-Datei (PE-Signatur fehlt bei Offset "
+                                f"0x{pe_offset:X}). Datei möglicherweise abgeschnitten.")
+                    # Mindestgröße: PyInstaller-EXEs sind typisch > 5 MB
+                    file_size = os.path.getsize(new_path)
+                    if file_size < 5_000_000:
+                        raise ValueError(
+                            f"{name}: Datei zu klein ({file_size/1_048_576:.1f} MB) – "
+                            f"Download unvollständig.")
 
                     downloaded.append((name, new_path))
 
-                # Update-Batch schreiben
-                # Wartet aktiv bis beide Prozesse wirklich beendet sind,
-                # dann noch 4 Sekunden für PyInstaller _MEI-Ordner-Cleanup
-                bat_path = os.path.join(app_dir, "badesee_update.bat")
+                # Update-Skript als PowerShell schreiben (zuverlässiger als .bat)
+                # Wartet aktiv bis beide Prozesse beendet sind + MEI-Cleanup-Puffer
+                ps_path = os.path.join(app_dir, "badesee_update.ps1")
                 steuerung = os.path.join(app_dir, "Badesee_Steuerung.exe")
-                lines = [
-                    "@echo off",
-                    "echo Warte auf Prozessende...",
-                    # Warte bis Badesee_Steuerung.exe nicht mehr laeuft
-                    ":wait_steuerung",
-                    'tasklist /fi "imagename eq Badesee_Steuerung.exe" 2>nul'
-                    ' | find /i "Badesee_Steuerung.exe" >nul',
-                    "if not errorlevel 1 (",
-                    "    timeout /t 1 /nobreak > nul",
-                    "    goto wait_steuerung",
-                    ")",
-                    # Warte bis Badesee_Anzeige.exe nicht mehr laeuft
-                    ":wait_anzeige",
-                    'tasklist /fi "imagename eq Badesee_Anzeige.exe" 2>nul'
-                    ' | find /i "Badesee_Anzeige.exe" >nul',
-                    "if not errorlevel 1 (",
-                    "    timeout /t 1 /nobreak > nul",
-                    "    goto wait_anzeige",
-                    ")",
-                    # Extra-Puffer fuer PyInstaller _MEI-Ordner-Cleanup
-                    "timeout /t 4 /nobreak > nul",
-                ]
-                for name, new_path in downloaded:
-                    orig = os.path.join(app_dir, name)
-                    lines.append(f'move /y "{new_path}" "{orig}"')
-                lines.append(f'start "" "{steuerung}"')
-                lines.append('del "%~f0"')
-                with open(bat_path, "w", encoding="cp1252") as f:
-                    f.write("\r\n".join(lines))
+                move_lines = "\n".join(
+                    f'Move-Item -Force "{new_p}" "{os.path.join(app_dir, nm)}"'
+                    for nm, new_p in downloaded
+                )
+                ps_script = f"""
+# Warten bis Badesee_Steuerung beendet ist
+while (Get-Process -Name "Badesee_Steuerung" -ErrorAction SilentlyContinue) {{
+    Start-Sleep -Milliseconds 500
+}}
+# Warten bis Badesee_Anzeige beendet ist
+while (Get-Process -Name "Badesee_Anzeige" -ErrorAction SilentlyContinue) {{
+    Start-Sleep -Milliseconds 500
+}}
+# Puffer fuer PyInstaller _MEI-Ordner Cleanup
+Start-Sleep -Seconds 5
+# Dateien ersetzen
+{move_lines}
+# Neue Version starten (mit App-Verzeichnis als Arbeitsverzeichnis)
+Start-Process -FilePath "{steuerung}" -WorkingDirectory "{app_dir}"
+# Skript loeschen
+Remove-Item $PSCommandPath -ErrorAction SilentlyContinue
+""".strip()
+                with open(ps_path, "w", encoding="utf-8") as f:
+                    f.write(ps_script)
+                bat_path = ps_path  # Variable fuer _finish_auto_update weiterverwenden
 
                 prog.after(0, lambda bp=bat_path: self._finish_auto_update(prog, bp))
 
@@ -1991,7 +2010,7 @@ class ControlPanel:
 
         threading.Thread(target=download_thread, daemon=True).start()
 
-    def _finish_auto_update(self, prog_dialog, bat_path):
+    def _finish_auto_update(self, prog_dialog, ps_path):
         prog_dialog.destroy()
         if messagebox.askyesno(
             "Update bereit",
@@ -2001,10 +2020,16 @@ class ControlPanel:
             "Jetzt installieren?"
         ):
             self._stop_displays()
-            subprocess.Popen(bat_path, shell=True,
-                             creationflags=subprocess.CREATE_NO_WINDOW
-                             if sys.platform == "win32" else 0)
-            self.root.after(600, self.root.destroy)
+            # PowerShell-Skript vollständig losgelöst vom aktuellen Prozess starten
+            subprocess.Popen(
+                ["powershell.exe", "-NonInteractive", "-WindowStyle", "Hidden",
+                 "-ExecutionPolicy", "Bypass", "-File", ps_path],
+                creationflags=(subprocess.DETACHED_PROCESS |
+                               subprocess.CREATE_NEW_PROCESS_GROUP)
+                if sys.platform == "win32" else 0,
+                close_fds=True,
+            )
+            self.root.after(800, self.root.destroy)
 
     # ── Display starten/stoppen ───────────────────────────────────────────────
 
